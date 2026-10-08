@@ -2,6 +2,11 @@ version: 2
 updates:
   - package-ecosystem: gomod
     directory: "/"
+    # The PR title check only knows fix, feat, docs, ci and chore. Dependabot's
+    # default, "build(deps): ...", is none of them.
+    commit-message:
+      prefix: chore
+      include: scope
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
@@ -15,6 +20,11 @@ updates:
 
   - package-ecosystem: github-actions
     directory: "/"
+    # The PR title check only knows fix, feat, docs, ci and chore. Dependabot's
+    # default, "build(deps): ...", is none of them.
+    commit-message:
+      prefix: chore
+      include: scope
     schedule:
       interval: weekly
 
@@ -22,5 +32,10 @@ updates:
   # pinned in VYOS_VERSION and bumped by the bump-vyos workflow.
   - package-ecosystem: docker
     directory: "/"
+    # The PR title check only knows fix, feat, docs, ci and chore. Dependabot's
+    # default, "build(deps): ...", is none of them.
+    commit-message:
+      prefix: chore
+      include: scope
     schedule:
       interval: weekly

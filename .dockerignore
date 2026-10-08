@@ -1,0 +1,7 @@
+*
+!build/rootfs.tar.xz
+!go.mod
+!go.sum
+!cmd/
+!internal/
+**/*_test.go

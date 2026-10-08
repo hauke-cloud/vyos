@@ -1,0 +1,9 @@
+.cache/
+build/
+bin/
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+coverage.out

@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  # Only the builder of the failover helper; the VyOS root filesystem is
+  # pinned in VYOS_VERSION and bumped by the bump-vyos workflow.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly

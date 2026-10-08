@@ -1,0 +1,7 @@
+---
+title: vyos
+description: VyOS rolling release as a container image, with a helper that moves Hetzner Cloud Floating IPs, alias IPs and routes on VRRP failover.
+logo: ""
+docker_image_registry: "ghcr.io"
+docker_image_namespace: "hauke-cloud/vyos"
+docker_image_version: "latest"

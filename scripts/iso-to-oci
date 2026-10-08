@@ -1,0 +1,211 @@
+#!/bin/bash
+
+cleanup() {
+    # spin() hides the cursor while animating - make sure it comes back if we
+    # are interrupted mid step
+    if [[ -t 1 ]]; then
+        tput cnorm 2>/dev/null || true
+    fi
+    if [[ -n "${WORKDIR:-}" && -d "${WORKDIR:-}" ]]; then
+        rm -rf "${WORKDIR}"
+    fi
+}
+
+# Run a long running command while animating a spinner - unpacking an ISO and
+# compressing the rootfs keep the script silent for minutes and it looks hung.
+# Only animate when stdout is a terminal, "make oci" in CI or a piped log gets
+# the plain message instead. Output of the wrapped command is discarded as
+# before, but unlike before its exit code is checked.
+spin() {
+    # exit codes accepted as success in addition to 0 - unsquashfs(1) returns 2
+    # for non fatal errors, which is what we always get when running as a
+    # regular user (device nodes and xattrs can not be restored)
+    local allow_rc=""
+    if [[ "$1" == "--allow-rc" ]]; then
+        allow_rc="$2"; shift 2
+    fi
+    local message="$1"; shift
+    local frames='|/-\'
+    local rc=0 i=0
+
+    if [[ ! -t 1 ]]; then
+        echo "I: ${message}"
+        "$@" >/dev/null 2>&1 || rc=$?
+    else
+        "$@" >/dev/null 2>&1 &
+        local pid=$!
+        tput civis 2>/dev/null
+        while kill -0 "${pid}" 2>/dev/null; do
+            printf '\r%s %s' "${frames:i++%4:1}" "${message}"
+            sleep 0.1
+        done
+        wait "${pid}" || rc=$?
+        tput cnorm 2>/dev/null
+        # replace the spinner with the very same line the non interactive run
+        # would have printed
+        printf '\r\033[K'
+        echo "I: ${message}"
+    fi
+
+    if (( rc )) && [[ " ${allow_rc} " != *" ${rc} "* ]]; then
+        echo "E: ${message} failed with exit code ${rc}"
+        exit 1
+    fi
+}
+
+if [[ "$#" -ne 1 ]]; then
+    echo "Usage: $0 <path-to-iso>"
+    exit 2
+fi
+
+ISO=$1
+if [[ ! -f "$ISO" ]]; then
+    echo "E: ISO file not found: $ISO"
+    exit 2
+fi
+
+# ensure clean working directory
+cleanup
+
+# required commands and the Debian package providing them
+declare -A REQUIRED_COMMANDS=(
+    [xorriso]="xorriso"
+    [unsquashfs]="squashfs-tools"
+    [jq]="jq"
+    [tar]="tar"
+    [xz]="xz-utils"
+)
+
+for cmd in "${!REQUIRED_COMMANDS[@]}"; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        echo "E: missing dependency: ${cmd}"
+        echo "   Install ${REQUIRED_COMMANDS[$cmd]} or run inside the vyos-build container."
+        exit 2
+    fi
+done
+
+WORKDIR="$(mktemp -d -t iso-to-oci.XXXXXXXXXX)"
+trap cleanup EXIT
+
+ROOTFS="${WORKDIR}/iso"
+UNSQUASHFS="${WORKDIR}/unsquashfs"
+mkdir -p "${ROOTFS}/live" "${UNSQUASHFS}"
+
+spin "extracting ISO metadata - version.json" \
+    xorriso -osirrox on -indev "${ISO}" -extract /version.json "${ROOTFS}/version.json"
+
+spin "extracting ISO data - squashfs image" \
+    xorriso -osirrox on -indev "${ISO}" -extract /live/filesystem.squashfs "${ROOTFS}/live/filesystem.squashfs"
+
+# create directory, unpack squashfs filesystem, get ISO version
+spin --allow-rc 2 "extracting squashfs content" \
+    unsquashfs -follow -dest "${UNSQUASHFS}/" "${ROOTFS}/live/filesystem.squashfs"
+VERSION="$(jq --raw-output .version "${ROOTFS}/version.json")"
+# older ISOs predate ARM64 support and carry no architecture in version.json
+ARCH="$(jq --raw-output '.architecture // "amd64"' "${ROOTFS}/version.json")"
+OCI_IMAGE="vyos-${VERSION}-oci-${ARCH}.tar.xz"
+
+# fix locales for correct system configuration loading
+sed -i 's/^LANG=.*$/LANG=C.UTF-8/' "${UNSQUASHFS}/etc/default/locale"
+
+# seed the VyOS pre-login banner - /etc/issue is owned by the base-files
+# package and only replaced once system_login_banner.py runs on the first
+# commit, but getty(8) is up long before that and would greet the user with
+# "Debian GNU/Linux 12". Keep in sync with default_config_data in
+# system_login_banner.py
+printf 'Welcome to VyOS - \\n \\l\n\n' > "${UNSQUASHFS}/etc/issue"
+: > "${UNSQUASHFS}/etc/issue.net"
+
+# adjust systemd units for containerized operation - this is what the
+# containerlab documentation asks users to do in their Dockerfile, but as we
+# ship a ready made rootfs there is no build stage where "systemctl" could be
+# run. Masking and disabling is nothing but symlink handling below /etc/systemd,
+# so we can do it offline (and cross-architecture) right here.
+#
+# masked units: getty(8) would fight with the container console, auditd(8) has
+# no business inside a container as it requires the audit netlink socket and
+# atopacctd(8) enables BSD process accounting via acct(2) which is global to
+# the kernel and not namespaced - the first container to start it wins, every
+# other one fails and turns "systemctl is-system-running" into "degraded",
+# which is exactly what the containerlab healthcheck looks at
+for unit in getty.target auditd.service atopacct.service; do
+    ln -sf /dev/null "${UNSQUASHFS}/etc/systemd/system/${unit}"
+done
+
+# disabled units: kea-dhcp-ddns-server(8) is started via a "WantedBy" symlink
+# and would fail on boot, VyOS enables it on demand from the CLI
+for unit in kea-dhcp-ddns-server.service; do
+    find "${UNSQUASHFS}/etc/systemd/system" -name "${unit}" \
+        \( -path '*.wants/*' -o -path '*.requires/*' \) -delete
+done
+
+# optional step: Decrease docker image size by deleting not necessary files for container
+rm -rf "${UNSQUASHFS}/boot"
+rm -rf "${UNSQUASHFS}/lib/firmware/"
+rm -rf "${UNSQUASHFS}/usr/lib/x86_64-linux-gnu/libwireshark.so*"
+rm -rf "${UNSQUASHFS}/lib/modules/*-vyos"
+rm -rf "${UNSQUASHFS}/root/.gnupg"
+
+# podman(8) is useless inside the container as we do not support running
+# containers in containers - the CLI nodes are removed below anyway. Dropping
+# the runtime and its network helpers (netavark, aardvark-dns) saves about
+# 110 MiB of the uncompressed rootfs. Nothing but the container CLI calls
+# these, so they can go entirely - including the systemd units, the quadlet
+# generators and the configuration shipped by containers-common
+rm -f "${UNSQUASHFS}/etc/systemd/system/default.target.wants/podman.service"
+rm -f "${UNSQUASHFS}/usr/lib/systemd/system/podman.service"
+rm -f "${UNSQUASHFS}/usr/lib/systemd/system/podman.socket"
+rm -f "${UNSQUASHFS}/usr/lib/systemd/system/netavark-dhcp-proxy.service"
+rm -f "${UNSQUASHFS}/usr/lib/systemd/system/netavark-dhcp-proxy.socket"
+rm -f "${UNSQUASHFS}/usr/lib/systemd/system/netavark-firewalld-reload.service"
+rm -f "${UNSQUASHFS}/usr/lib/systemd/system-generators/podman-system-generator"
+rm -f "${UNSQUASHFS}/usr/lib/systemd/user-generators/podman-user-generator"
+rm -f "${UNSQUASHFS}/usr/lib/tmpfiles.d/podman.conf"
+rm -rf "${UNSQUASHFS}/usr/lib/podman"
+rm -rf "${UNSQUASHFS}/usr/libexec/podman"
+rm -f "${UNSQUASHFS}/usr/bin/podman" "${UNSQUASHFS}/usr/bin/podman-remote" \
+      "${UNSQUASHFS}/usr/bin/podmansh" "${UNSQUASHFS}/usr/bin/conmon" \
+      "${UNSQUASHFS}/usr/bin/fuse-overlayfs" "${UNSQUASHFS}/usr/bin/runc" \
+      "${UNSQUASHFS}/usr/sbin/runc"
+rm -rf "${UNSQUASHFS}/etc/containers"
+rm -rf "${UNSQUASHFS}/usr/share/containers"
+
+# delete features not supported in container - only remove the node.def files,
+# this is sufficient to not make the feature pop up on the CLI. The container
+# operational mode commands go as well, they would only greet the user with a
+# traceback now that podman is gone
+rm -rf "${UNSQUASHFS}/opt/vyatta/share/vyatta-cfg/templates/container"
+for tree in add connect delete generate restart show update; do
+    rm -rf "${UNSQUASHFS}/opt/vyatta/share/vyatta-op/templates/${tree}/container"
+done
+rm -rf "${UNSQUASHFS}/opt/vyatta/share/vyatta-cfg/templates/system/console"
+rm -rf "${UNSQUASHFS}/opt/vyatta/share/vyatta-cfg/templates/system/option/kernel"
+rm -rf "${UNSQUASHFS}/opt/vyatta/share/vyatta-cfg/templates/system/option/startup-beep"
+rm -rf "${UNSQUASHFS}/opt/vyatta/share/vyatta-cfg/templates/system/option/root-partition-auto-resize"
+rm -rf "${UNSQUASHFS}/opt/vyatta/share/vyatta-cfg/templates/system/option/reboot-on-panic"
+rm -rf "${UNSQUASHFS}/opt/vyatta/share/vyatta-cfg/templates/system/option/performance"
+
+# create a symbolic link to the configuration - /config already exists as an
+# empty directory in the squashfs, so it must go first. A plain "ln -s" would
+# happily create /config/config instead and leave /config a dead directory.
+rmdir "${UNSQUASHFS}/config" || { echo "E: /config is not an empty directory"; exit 1; }
+ln -s /opt/vyatta/etc/config "${UNSQUASHFS}/config"
+
+# create docker image
+spin "generating OCI container image ${OCI_IMAGE}" \
+    env XZ_OPT=-T0 tar --directory "${UNSQUASHFS}" --create . --xz --file "${OCI_IMAGE}"
+
+# containerlab uses the image healthcheck to determine when a VyOS node is
+# ready, see https://containerlab.dev/manual/kinds/vyosnetworks_vyos/
+# A rootfs tarball carries no OCI image configuration, so this can only be
+# attached when the tarball is imported - keep in sync with get_import_cmd()
+# in scripts/check-oci-container
+HEALTHCHECK='HEALTHCHECK --start-period=10s CMD systemctl is-system-running'
+
+echo "I: to import the previously generated OCI image to your local images run:"
+echo ""
+echo "   docker import --platform=linux/$ARCH $OCI_IMAGE vyos/vyos:$VERSION \\"
+echo "       --change 'CMD [\"/sbin/init\"]' --change '$HEALTHCHECK'"
+echo ""
+
+cleanup

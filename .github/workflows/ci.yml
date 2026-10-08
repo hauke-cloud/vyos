@@ -1,0 +1,65 @@
+---
+name: CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  GO_VERSION: "1.27"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Build, Test, and Release
+        uses: hauke-cloud/inpacken-un-af-dor-mit@v1
+        with:
+          # Language: the failover helper is Go, the rest is a root filesystem.
+          language: "go"
+          language-version: ${{ env.GO_VERSION }}
+
+          # Container Build. VyOS nightlies are amd64 only.
+          dockerfile-path: "./Dockerfile"
+          docker-context: "."
+          platforms: "linux/amd64"
+
+          # Registry
+          registry: "ghcr.io"
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image-name: ${{ github.repository }}
+
+          enable-helm: "false"
+
+          # The Dockerfile adds build/rootfs.tar.xz, so it has to exist before
+          # the action builds. `make ci-image` also builds the image with the
+          # runner's rootful docker and boots it: the action's own build never
+          # loads the image, and it pushes right after building, so this is the
+          # only place a broken image can still be stopped.
+          pre-build-command: |
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends xorriso squashfs-tools jq xz-utils
+            make ci-image
+
+          # Testing
+          run-tests: "true"
+          test-command: "make test"
+          enable-coverage: "false"
+
+          # Linting. The action splices `lint-command` verbatim into an
+          # `if [ -n "..." ]` test before running it, so anything with quotes
+          # or a `$(...)` in it breaks there. Hence a bare `make` target.
+          run-lint: "true"
+          lint-command: "make ci-lint"
+
+          # Release
+          enable-release: "true"
+          release-draft: "false"

@@ -9,7 +9,7 @@
 
 # The failover helper is the only thing in the image that is ours. It is a
 # static binary, so it does not care what the VyOS userland looks like.
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS failover
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27-alpine AS failover
 
 WORKDIR /src
 

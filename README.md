@@ -68,8 +68,14 @@ It asks the metadata service which server it is on and then, for the named group
 - removes the group's **alias IPs** from whichever server holds them and adds them here,
 - repoints the group's **network routes** at this server's address in that network.
 
-It is idempotent, waits for every Hetzner action to complete, keeps going after an error (half a
-failover restores half the service) and exits non-zero if anything failed.
+It is idempotent, waits for every Hetzner action to complete and keeps going after an error
+(half a failover restores half the service). What failed is tried again every two seconds until
+it works or `-timeout` is up: when a router is being replaced, the address it held is locked for
+a moment while its server is deleted.
+
+The helper talks to `api.hetzner.cloud`, so **the router needs a name server**
+(`set system name-server ...`). Without one VRRP still elects a master, and the addresses stay
+where they were.
 
 Configuration is `/config/hetzner/failover.json`:
 

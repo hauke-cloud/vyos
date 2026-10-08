@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"time"
 )
 
 // FloatingIP is a Hetzner Cloud Floating IP.
@@ -64,6 +65,28 @@ func Takeover(ctx context.Context, cloud Cloud, serverID int64, group Group) err
 		takeFloatingIPs(ctx, cloud, serverID, group.FloatingIPs),
 		takePrivate(ctx, cloud, serverID, group),
 	)
+}
+
+// TakeoverUntilDone calls Takeover until it succeeds or ctx ends, waiting
+// interval between attempts, and reports every failed attempt to onError.
+//
+// A failover runs into transient refusals. When a router is replaced, the new
+// master tries to take a Floating IP at the moment the server that held it is
+// being deleted, and Hetzner answers that the address is locked. Giving up
+// there would leave the address assigned to nobody.
+func TakeoverUntilDone(ctx context.Context, cloud Cloud, serverID int64, group Group, interval time.Duration, onError func(error)) error {
+	for {
+		err := Takeover(ctx, cloud, serverID, group)
+		if err == nil {
+			return nil
+		}
+		onError(err)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(interval):
+		}
+	}
 }
 
 func takeFloatingIPs(ctx context.Context, cloud Cloud, serverID int64, ips []string) error {

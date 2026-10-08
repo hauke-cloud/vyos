@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -263,5 +264,53 @@ func TestTakeoverUnknownServer(t *testing.T) {
 
 	if err := Takeover(context.Background(), cloud, 999, group); err == nil {
 		t.Fatal("Takeover for a server that is not in the project succeeded")
+	}
+}
+
+// flakyCloud fails the first assignments of a Floating IP, the way Hetzner
+// does while the server that held it is being deleted.
+type flakyCloud struct {
+	*fakeCloud
+	failures int
+}
+
+func (f *flakyCloud) AssignFloatingIP(ctx context.Context, id, serverID int64) error {
+	if f.failures > 0 {
+		f.failures--
+		return errors.New("floating IP is locked")
+	}
+	return f.fakeCloud.AssignFloatingIP(ctx, id, serverID)
+}
+
+func TestTakeoverUntilDoneRetries(t *testing.T) {
+	cloud := &flakyCloud{fakeCloud: newProject(), failures: 2}
+	group := Group{FloatingIPs: []string{"203.0.113.10"}}
+	var reported []error
+
+	err := TakeoverUntilDone(context.Background(), cloud, self, group, time.Millisecond, func(err error) { reported = append(reported, err) })
+
+	if err != nil {
+		t.Fatalf("TakeoverUntilDone: %v", err)
+	}
+	if got := cloud.floatingIPs[0].ServerID; got != self {
+		t.Errorf("floating IP on server %d, want %d", got, self)
+	}
+	// Each failure is reported: a failover that needed three attempts is
+	// something to know about.
+	if len(reported) != 2 {
+		t.Errorf("%d failures reported, want 2", len(reported))
+	}
+}
+
+func TestTakeoverUntilDoneGivesUpWithTheContext(t *testing.T) {
+	cloud := &flakyCloud{fakeCloud: newProject(), failures: 1 << 30}
+	group := Group{FloatingIPs: []string{"203.0.113.10"}}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	err := TakeoverUntilDone(ctx, cloud, self, group, time.Millisecond, func(error) {})
+
+	if err == nil || !strings.Contains(err.Error(), "locked") {
+		t.Errorf("err = %v, want the last failure", err)
 	}
 }

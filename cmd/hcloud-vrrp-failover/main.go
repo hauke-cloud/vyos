@@ -57,7 +57,7 @@ func run(args []string) int {
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
 
-	if err := takeover(ctx, *configPath, group, *serverID); err != nil {
+	if err := takeover(ctx, log, *configPath, group, *serverID); err != nil {
 		log.Error("failover failed", "error", err)
 		return 1
 	}
@@ -65,7 +65,10 @@ func run(args []string) int {
 	return 0
 }
 
-func takeover(ctx context.Context, configPath, groupName string, serverID int64) error {
+// retryInterval is how long to wait before trying a failed failover again.
+const retryInterval = 2 * time.Second
+
+func takeover(ctx context.Context, log *slog.Logger, configPath, groupName string, serverID int64) error {
 	cfg, err := failover.LoadConfig(configPath)
 	if err != nil {
 		return err
@@ -84,5 +87,7 @@ func takeover(ctx context.Context, configPath, groupName string, serverID int64)
 		}
 	}
 	cloud := failover.NewHetznerCloud(token, failover.WithApplication("hcloud-vrrp-failover", version))
-	return failover.Takeover(ctx, cloud, serverID, group)
+	return failover.TakeoverUntilDone(ctx, cloud, serverID, group, retryInterval, func(err error) {
+		log.Warn("failover attempt failed, trying again", "error", err)
+	})
 }

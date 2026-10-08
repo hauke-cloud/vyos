@@ -85,15 +85,20 @@ rootfs: $(ROOTFS) ## Download and verify the pinned ISO, convert it to a rootfs 
 # --format docker: podman drops HEALTHCHECK from an OCI-format image.
 IMAGE_FORMAT := $(if $(findstring podman,$(CONTAINER_ENGINE)),--format docker,)
 
+.PHONY: container-engine
+container-engine:
+	@test -n "$(CONTAINER_ENGINE)" || { \
+	  echo "no container engine found: start docker, install podman, or set CONTAINER_ENGINE" >&2; exit 1; }
+
 .PHONY: image
-image: $(ROOTFS) ## Build the container image for the host platform
+image: container-engine $(ROOTFS) ## Build the container image for the host platform
 	$(CONTAINER_ENGINE) build $(IMAGE_FORMAT) \
 	  --build-arg VERSION=$(VERSION) \
 	  --build-arg COMMIT=$(COMMIT) \
 	  -t $(IMAGE):$(IMAGE_TAG) .
 
 .PHONY: smoke
-smoke: ## Boot the image and round-trip a configuration through the REST API
+smoke: container-engine ## Boot the image and round-trip a configuration through the REST API
 	CONTAINER_ENGINE=$(CONTAINER_ENGINE) test/smoke.sh $(IMAGE):$(IMAGE_TAG)
 
 .PHONY: ci-image
